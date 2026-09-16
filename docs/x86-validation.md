@@ -17,17 +17,26 @@ code. Expect more of the same here.
 
 ## Getting it onto the host
 
-No Go needed on the target. Copy the static binary:
+No Go needed on the target. Either pull the release directly:
 
 ```sh
+curl -fsSLO https://github.com/metcalfc/fc-preflight/releases/latest/download/fc-preflight-linux-amd64
+chmod +x fc-preflight-linux-amd64 && sudo mv fc-preflight-linux-amd64 /tmp/fc-preflight
+```
+
+or build and copy from a checkout:
+
+```sh
+make release
 scp dist/fc-preflight-linux-amd64 you@host:/tmp/fc-preflight
 ssh you@host chmod +x /tmp/fc-preflight
 ```
 
-Verify it arrived intact:
+Verify it arrived intact — `sha256sum /tmp/fc-preflight` against `SHA256SUMS`
+in the release, currently:
 
 ```
-006ed4f6a589bdeebfc3b763eddfb203a168f2801b8db2c0927e3ef2bb79a0ef  fc-preflight-linux-amd64
+ae1a46aad9b5ee3e987c84378573b9704f7cadf44b78b56b8c6b1fbb35880ddb  fc-preflight-linux-amd64
 ```
 
 The host needs `/dev/kvm`, root, `ip` from iproute2, and outbound HTTPS to

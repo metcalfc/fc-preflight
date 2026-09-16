@@ -1,3 +1,4 @@
 dist/
 fc-preflight
 *.json
+reference/*.config

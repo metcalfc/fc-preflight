@@ -148,11 +148,10 @@ guest has no `/boot` and no `/lib/modules` — the kernel is supplied by the hos
 and every driver is built in, so no part of it exists in the guest filesystem.
 It has to come from Fly's infrastructure team.
 
-What we can give you is the **config it is built with**, in
-[`reference/fly-guest-kernel-6.12.105-fly.config`](reference/). That is the
-`/proc/config.gz` of a live Fly machine — the "`/boot/config` from our reference
-image" we promised, obtained the only way it can be. Diff it against the config
-of any kernel you plan to boot.
+What we can give you is the **config it is built with**, which Fly sends
+directly rather than publishing — see [`reference/`](reference/) for where to
+drop it and how it was obtained. Diff it against the config of any kernel you
+plan to boot.
 
 Once you have Fly's actual `vmlinux`, re-run with `-kernel ./vmlinux-fly`. That
 is the run that proves the host boots *our* guest, not merely *a* guest.
@@ -160,19 +159,14 @@ is the run that proves the host boots *our* guest, not merely *a* guest.
 ### A difference worth knowing about
 
 Fly's guests boot with `acpi=off` and an explicit `virtio_mmio.device=`
-argument for each device. Stock Firecracker on x86_64 enumerates devices
-through ACPI instead. So this tool's default boot line is Firecracker's
-documented baseline, not Fly's — passing `acpi=off` to stock Firecracker boots
-a guest that finds no devices at all. `-boot-args` overrides it if you want to
-experiment. For reference, a real Fly guest's `/proc/cmdline` is:
+argument for each device, so the guest learns its device topology from the
+kernel command line. Stock Firecracker on x86_64 enumerates devices through
+ACPI instead.
 
-```
-console=ttyS0 reboot=k panic=1 pci=off cgroup_enable=memory swapaccount=1
-random.trust_cpu=on i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd acpi=off
-lapic=notscdeadline sysctl.kernel.panic_on_rcu_stall=1 quiet
-cgroup_no_v1=all systemd.unified_cgroup_hierarchy=1 root=/dev/vda ro
-virtio_mmio.device=4K@0xc0001000:6  [... one per device ...]
-```
+So this tool's default boot line is Firecracker's documented baseline, not
+Fly's — passing `acpi=off` to stock Firecracker boots a guest that finds no
+devices at all. `-boot-args` overrides it if you want to experiment, and
+`boot.virtio` is the check that fails when the two disagree.
 
 ## Reading the report
 
