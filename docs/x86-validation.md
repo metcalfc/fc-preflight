@@ -43,7 +43,7 @@ Verify it arrived intact — `sha256sum /tmp/fc-preflight` against `SHA256SUMS`
 in the release, currently:
 
 ```
-7da6f178d285dd2d54345a45bea54366b2c2eb2efc0ea74efcd9fdd25aee7746  fc-preflight-linux-amd64
+b7dbd5f7adc82f030c0e4a93f5d807137cc536d475cef9ec098c8a2732adc947  fc-preflight-linux-amd64
 ```
 
 The host needs `/dev/kvm`, root, `ip` from iproute2, and outbound HTTPS to
