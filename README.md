@@ -258,12 +258,20 @@ correctly identifies the cause — including the case where `CONFIG_KVM=y` but
 neither vendor module is built, which passes a naive config check and then has
 no device to open.
 
-**x86_64 is verified too**, on an Intel bare-metal host: all 14 required KVM
-capabilities resolve, `KVM_CREATE_VM`/`KVM_CREATE_VCPU` succeed, and a microVM
-boots in 90 ms to init, binds `virtio_blk` and `virtio_net`, and runs the
-workload. The one check not exercised there is the guest↔host network round
-trip, because that host drops RFC1918 traffic by policy — which is what
-`host.firewall` now warns about up front.
+**x86_64 is fully verified**, on an Intel bare-metal host (i5-1340P, 16
+threads), from a fresh clone built with `make build`:
+
+- every preflight check passes, including all 14 required KVM capabilities and
+  a real `KVM_CREATE_VM` / `KVM_CREATE_VCPU`
+- a microVM reaches init in **80 ms**, binds `virtio_blk` and `virtio_net`,
+  runs the workload and shuts down cleanly — `clock_gettime` 45 ns, guest
+  network 41 µs RTT at 22 Gb/s, disk 567 MB/s write / 3.7 GB/s read
+- **8 concurrent microVMs** all boot and pass, at 148 ms mean to init
+  (110–200 ms) and 83 µs mean RTT
+
+For contrast, the same run nested under Apple Virtualization reaches init in
+1400 ms with `clock_gettime` at 124 ns under load. That gap is the thing to
+measure on a nested Azure host before accepting one.
 
 **Not yet verified:** any run against Fly's own guest kernel, which has to come
 from Fly's infrastructure team.

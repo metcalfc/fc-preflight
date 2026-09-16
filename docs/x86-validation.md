@@ -1,8 +1,15 @@
 # Validating fc-preflight on x86_64
 
-The tool has been run end to end on aarch64 (Lima on Apple Silicon, nested).
-The x86_64 paths build and vet cleanly but **have never been executed**. This
-is the plan to close that.
+> **Status: done.** This ran on an Intel bare-metal host (Ubuntu 24.04,
+> i5-1340P) on 2026-09-16 and everything passes — see the Status section in the
+> README. The plan is kept because it is the same plan for any new host, and
+> because what it found is worth reading before you run it somewhere else.
+>
+> It found three bugs, none of them visible by reading the code: a healthy host
+> reported as unsuitable because the tool was run without `sudo`; a
+> dynamically linked binary packed as the guest init, which panicked the guest
+> with an ENOENT that pointed at the archive rather than the binary; and a host
+> firewall silently failing the guest network test.
 
 Read the framing first, because it changes what you are looking at: **this run
 is a test of the tool, not of the host.** The host is assumed good. Anything
