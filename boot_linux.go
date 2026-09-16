@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -309,8 +310,11 @@ func bootOne(ctx context.Context, i int, fcBin, kernel, initramfs, workDir strin
 	sf.Close()
 	defer os.Remove(scratch)
 
-	bootArgs := fmt.Sprintf("%s fcpf.ip=%s fcpf.mask=%s fcpf.host=%s fcpf.port=%d",
-		*flagBootArgs, vmGuestIP(i), guestNetmask, vmHostIP(i), echoPort)
+	// The scratch drive is the only block device attached and there is no root
+	// device, so the guest sees it as /dev/vda. Telling it rather than letting
+	// it guess means adding a rootfs later does not silently move the target.
+	bootArgs := fmt.Sprintf("%s fcpf.ip=%s fcpf.mask=%s fcpf.host=%s fcpf.port=%d fcpf.disk=%s",
+		*flagBootArgs, vmGuestIP(i), guestNetmask, vmHostIP(i), echoPort, "/dev/vda")
 
 	cfg := map[string]any{
 		"boot-source": map[string]any{
@@ -535,23 +539,41 @@ func judgeOutcomes(r *Report, outcomes []vmOutcome) {
 	r.Addf("boot.launch", "Firecracker microVM boots", Pass,
 		"%d of %d microVMs booted, ran the workload and shut down cleanly", len(outcomes), len(outcomes))
 
-	// Aggregate. With one VM these are just its numbers; with several, the
-	// spread is the interesting part.
+	// Aggregate. With several microVMs the spread matters more than the mean:
+	// a density run is asking what happens to the slowest one, not to the
+	// average one. Every number below is therefore a mean with its range, and
+	// says so -- an earlier version mixed means and vm0's own figures under
+	// the same labels, which is unreadable in a report someone else has to
+	// interpret.
 	g := outcomes[0].Guest
-	var sumBoot, sumClock, sumHash, sumMem, sumRTT, sumNet float64
+	n := len(outcomes)
+
+	stat := func(pick func(*GuestReport) float64) (mean, lo, hi float64) {
+		lo, hi = math.Inf(1), math.Inf(-1)
+		var sum float64
+		for _, o := range outcomes {
+			v := pick(o.Guest)
+			sum += v
+			lo = math.Min(lo, v)
+			hi = math.Max(hi, v)
+		}
+		return sum / float64(n), lo, hi
+	}
+	// spread renders "X" for a single VM and "mean X (min..max over N)" for
+	// several, so the one-VM case does not read as if it had a range.
+	spread := func(unit string, mean, lo, hi float64) string {
+		if n == 1 {
+			return fmt.Sprintf("%.0f %s", mean, unit)
+		}
+		return fmt.Sprintf("mean %.0f %s (%.0f..%.0f over %d VMs)", mean, unit, lo, hi, n)
+	}
+
 	var netErrs []string
 	for _, o := range outcomes {
-		sumBoot += o.Guest.UptimeAtStart * 1000
-		sumClock += o.Guest.ClockReadNS
-		sumHash += o.Guest.CPUHashMBps
-		sumMem += o.Guest.MemWriteMBps
-		sumRTT += o.Guest.NetEchoRTTus
-		sumNet += o.Guest.NetThroughput
 		if o.Guest.NetError != "" {
 			netErrs = append(netErrs, fmt.Sprintf("vm%d: %s", o.Index, o.Guest.NetError))
 		}
 	}
-	n := float64(len(outcomes))
 
 	r.Add(Result{ID: "boot.guest_kernel", Title: "Guest kernel came up", Status: Pass,
 		Detail: fmt.Sprintf("%s, %d vCPU, %.0f MiB, clocksource %s",
@@ -586,32 +608,51 @@ func judgeOutcomes(r *Report, outcomes []vmOutcome) {
 		r.Fail("boot.network", "Guest networking",
 			strings.Join(netErrs, "; "),
 			"The guest could not reach the host over its tap device. Check that nothing on the host "+
-				"is filtering traffic on the 172.31.240.0/24 range.")
+				"is filtering traffic on the 172.31.240.0/22 range.")
 	} else {
+		rttMean, rttLo, rttHi := stat(func(g *GuestReport) float64 { return g.NetEchoRTTus })
+		tpMean, tpLo, tpHi := stat(func(g *GuestReport) float64 { return g.NetThroughput })
 		r.Add(Result{ID: "boot.network", Title: "Guest networking", Status: Pass,
-			Detail: fmt.Sprintf("echo RTT %.0f us, throughput %.0f Mb/s (mean of %d)",
-				sumRTT/n, sumNet/n, len(outcomes))})
+			Detail: fmt.Sprintf("echo RTT %s; throughput %s",
+				spread("us", rttMean, rttLo, rttHi), spread("Mb/s", tpMean, tpLo, tpHi)),
+			Data: map[string]any{"rtt_us_mean": rttMean, "throughput_mbps_mean": tpMean}})
 	}
 
+	bootMean, bootLo, bootHi := stat(func(g *GuestReport) float64 { return g.UptimeAtStart * 1000 })
+	var wallHi float64
+	for _, o := range outcomes {
+		wallHi = math.Max(wallHi, o.TotalMS)
+	}
 	r.Add(Result{ID: "boot.timing", Title: "Boot time", Status: Info,
-		Detail: fmt.Sprintf("guest reached init at %.0f ms (mean of %d); wall clock per VM %.0f ms",
-			sumBoot/n, len(outcomes), outcomes[0].TotalMS),
-		Data: map[string]any{"boot_ms_mean": sumBoot / n}})
+		Detail: fmt.Sprintf("guest reached init at %s; slowest VM took %.0f ms wall clock end to end",
+			spread("ms", bootMean, bootLo, bootHi), wallHi),
+		Data: map[string]any{"boot_ms_mean": bootMean, "boot_ms_min": bootLo, "boot_ms_max": bootHi,
+			"wall_ms_max": wallHi}})
 
 	// The measurements to diff against a Fly host. clock_gettime cost is the
 	// single most sensitive one to nested virtualization, which is why it gets
 	// its own line.
+	clkMean, clkLo, clkHi := stat(func(g *GuestReport) float64 { return g.ClockReadNS })
 	r.Add(Result{ID: "boot.perf.clock", Title: "Guest clock_gettime cost", Status: Info,
-		Detail: fmt.Sprintf("%.1f ns per read (mean of %d)", sumClock/n, len(outcomes)),
-		Data:   map[string]any{"ns_per_read": sumClock / n}})
+		Detail: fmt.Sprintf("%s per read", spread("ns", clkMean, clkLo, clkHi)),
+		Data:   map[string]any{"ns_per_read_mean": clkMean, "ns_per_read_max": clkHi}})
+
+	cpu1Mean, cpu1Lo, cpu1Hi := stat(func(g *GuestReport) float64 { return g.CPUHashMBps })
+	cpuNMean, _, _ := stat(func(g *GuestReport) float64 { return g.CPUHashMBpsN })
 	r.Add(Result{ID: "boot.perf.cpu", Title: "Guest CPU", Status: Info,
-		Detail: fmt.Sprintf("sha256 %.0f MB/s single core, %.0f MB/s across %d vCPUs",
-			sumHash/n, g.CPUHashMBpsN, g.CPUs)})
+		Detail: fmt.Sprintf("sha256 single core %s; across %d vCPUs mean %.0f MB/s",
+			spread("MB/s", cpu1Mean, cpu1Lo, cpu1Hi), g.CPUs, cpuNMean)})
+
+	memMean, memLo, memHi := stat(func(g *GuestReport) float64 { return g.MemWriteMBps })
 	r.Add(Result{ID: "boot.perf.mem", Title: "Guest memory", Status: Info,
-		Detail: fmt.Sprintf("%.0f MB/s write", sumMem/n)})
+		Detail: fmt.Sprintf("write %s", spread("MB/s", memMean, memLo, memHi))})
+
 	if g.DiskWriteMBps > 0 {
+		dwMean, dwLo, dwHi := stat(func(g *GuestReport) float64 { return g.DiskWriteMBps })
+		drMean, drLo, drHi := stat(func(g *GuestReport) float64 { return g.DiskReadMBps })
 		r.Add(Result{ID: "boot.perf.disk", Title: "Guest disk (virtio-blk)", Status: Info,
-			Detail: fmt.Sprintf("%.0f MB/s write, %.0f MB/s read", g.DiskWriteMBps, g.DiskReadMBps)})
+			Detail: fmt.Sprintf("write %s; read %s",
+				spread("MB/s", dwMean, dwLo, dwHi), spread("MB/s", drMean, drLo, drHi))})
 	}
 
 	// Record every VM's full guest report in the JSON, for the diff.

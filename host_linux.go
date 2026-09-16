@@ -115,55 +115,121 @@ func parseKernelVersion(s string) (int, int, bool) {
 	return maj, min, err1 == nil && err2 == nil
 }
 
+// hypervisorDMI maps a DMI vendor or product string to the hypervisor it
+// indicates. Used on architectures where there is no CPU flag to ask.
+var hypervisorDMI = []struct{ match, name string }{
+	{"Microsoft Corporation", "Hyper-V / Azure"},
+	{"Apple Virtualization", "Apple Virtualization.framework"},
+	{"QEMU", "QEMU/KVM"},
+	{"Amazon EC2", "AWS Nitro"},
+	{"Google", "Google Compute Engine"},
+	{"VMware", "VMware"},
+	{"Xen", "Xen"},
+	{"KVM", "KVM"},
+	{"Bochs", "QEMU/Bochs"},
+	{"Parallels", "Parallels"},
+	{"innotek", "VirtualBox"},
+	{"Alibaba", "Alibaba Cloud"},
+}
+
+// detectHypervisor gathers every independent signal that this host is itself a
+// guest, and returns the name of the outer hypervisor if any signal fires.
+//
+// There is no single reliable test. On x86 the 'hypervisor' CPU flag is
+// conclusive when present. On aarch64 there is no such flag at all -- which is
+// exactly how an early version of this tool reported an Apple Virtualization
+// guest as bare metal. So DMI and systemd-detect-virt are consulted on every
+// architecture, and any one of them firing is enough.
+func detectHypervisor() (nested bool, name string, signals map[string]string) {
+	signals = map[string]string{}
+
+	if _, ok := cpuFlags()["hypervisor"]; ok {
+		signals["cpu_flag"] = "hypervisor"
+		nested = true
+	}
+
+	if out, err := exec.Command("systemd-detect-virt").Output(); err == nil {
+		v := strings.TrimSpace(string(out))
+		signals["systemd_detect_virt"] = v
+		if v != "" && v != "none" {
+			nested = true
+			name = v
+		}
+	}
+
+	vendor := readFileDefault("/sys/class/dmi/id/sys_vendor", "")
+	product := readFileDefault("/sys/class/dmi/id/product_name", "")
+	signals["dmi_vendor"] = vendor
+	signals["dmi_product"] = product
+	for _, h := range hypervisorDMI {
+		if strings.Contains(vendor, h.match) || strings.Contains(product, h.match) {
+			nested = true
+			name = h.name
+			break
+		}
+	}
+
+	if nested && name == "" {
+		name = "an unidentified hypervisor"
+	}
+	return nested, name, signals
+}
+
 // checkVirtPosture answers the question the Azure evaluation actually turns
 // on: is this bare metal, or a VM? Firecracker runs in both, but nested
 // virtualization costs real performance on every VM exit, and a microVM fleet
 // is a workload made of VM exits. The check never fails on nested -- it
 // reports it loudly, because which one they hand us is the finding.
 func checkVirtPosture(r *Report) {
-	flags := cpuFlags()
-	_, hypervisor := flags["hypervisor"]
+	nested, outer, signals := detectHypervisor()
 
-	vendor := readFileDefault("/sys/class/dmi/id/sys_vendor", "")
-	product := readFileDefault("/sys/class/dmi/id/product_name", "")
-	hypType := readFileDefault("/sys/hypervisor/type", "")
-
-	detected := "unknown"
-	if out, err := exec.Command("systemd-detect-virt").Output(); err == nil {
-		detected = strings.TrimSpace(string(out))
+	data := map[string]any{"nested": nested, "hypervisor": outer}
+	for k, v := range signals {
+		data[k] = v
 	}
 
-	data := map[string]any{
-		"nested": hypervisor, "dmi_vendor": vendor, "dmi_product": product,
-		"hypervisor_type": hypType, "systemd_detect_virt": detected,
-	}
-
-	if !hypervisor {
-		r.Add(Result{ID: "host.virt_posture", Title: "Bare metal or nested", Status: Pass,
-			Detail: fmt.Sprintf("bare metal -- no hypervisor CPU flag (DMI: %s %s)", vendor, product),
-			Data:   data})
-	} else {
-		outer := detected
-		switch {
-		case strings.Contains(vendor, "Microsoft"):
-			outer = "microsoft (Hyper-V / Azure)"
-		case outer == "" || outer == "unknown":
-			// systemd-detect-virt is absent or could not name it. The
-			// hypervisor CPU flag is still conclusive that we are a guest.
-			outer = "an unidentified hypervisor"
+	if !nested {
+		detail := fmt.Sprintf("bare metal -- no virtualization signal (DMI: %s %s)",
+			signals["dmi_vendor"], signals["dmi_product"])
+		if runtime.GOARCH != "amd64" {
+			// Worth stating: on aarch64 there is no 'hypervisor' CPU flag, so
+			// a guest whose host hides its DMI would land here too.
+			detail += "; note that aarch64 has no CPU flag for this, so this " +
+				"rests on DMI and systemd-detect-virt alone"
 		}
+		r.Add(Result{ID: "host.virt_posture", Title: "Bare metal or nested", Status: Pass,
+			Detail: detail, Data: data})
+	} else {
 		r.Add(Result{ID: "host.virt_posture", Title: "Bare metal or nested", Status: Warn,
-			Detail: fmt.Sprintf("NESTED -- this host is itself a guest of %s (DMI: %s %s)", outer, vendor, product),
-			Data:   data,
+			Detail: fmt.Sprintf("NESTED -- this host is itself a guest of %s (DMI: %s %s)",
+				outer, signals["dmi_vendor"], signals["dmi_product"]),
+			Data: data,
 			Remedy: "Firecracker will run, but every guest VM exit is handled by the outer hypervisor " +
 				"as well as by KVM here. Expect materially worse exit-bound latency than a Fly bare-metal " +
 				"host. Run the boot stage and compare boot_ms and the workload numbers before drawing " +
 				"a conclusion; that is what those measurements are for."})
 	}
 
-	// Without vmx/svm there is no KVM at all, nested or not. On a nested host
-	// this is the flag that says whether the outer layer exposed
-	// virtualization -- on Azure, whether the VM size supports it.
+	checkCPUVirtExtensions(r, nested)
+}
+
+// checkCPUVirtExtensions asks whether the CPU can host a VM at all.
+//
+// This is entirely architecture-specific and does not generalise. On x86 the
+// answer is a CPU flag. On aarch64 there is no flag: virtualization is the
+// availability of EL2, which the kernel consumes when it brings KVM up, and
+// the only honest test is whether KVM itself works -- which the kvm.* checks
+// establish by creating a VM and a vCPU. Reporting a missing 'vmx' on aarch64
+// is not a conservative check, it is a false failure.
+func checkCPUVirtExtensions(r *Report, nested bool) {
+	if runtime.GOARCH != "amd64" {
+		r.Addf("host.cpu_virt", "CPU virtualization extensions", Info,
+			"not a CPU-flag question on %s; virtualization availability is proven by the kvm.* "+
+				"checks below, which create a real VM and vCPU", runtime.GOARCH)
+		return
+	}
+
+	flags := cpuFlags()
 	_, vmx := flags["vmx"]
 	_, svm := flags["svm"]
 	switch {
@@ -173,7 +239,7 @@ func checkVirtPosture(r *Report) {
 		r.Addf("host.cpu_virt", "CPU virtualization extensions", Pass, "svm (AMD-V) present")
 	default:
 		remedy := "The CPU does not expose virtualization extensions. On bare metal, enable VT-x/AMD-V in firmware."
-		if hypervisor {
+		if nested {
 			remedy = "This is a nested host and the outer hypervisor is not exposing virtualization " +
 				"extensions to it. On Azure, use a VM size that supports nested virtualization " +
 				"(Dv3/Ev3 and later, or a bare-metal SKU)."
@@ -208,8 +274,18 @@ func cpuFlags() map[string]struct{} {
 	return out
 }
 
+// armImplementers decodes the "CPU implementer" field, which is where an
+// aarch64 /proc/cpuinfo puts the vendor. Azure's Arm SKUs are Neoverse, so
+// they report as ARM Ltd rather than as Microsoft.
+var armImplementers = map[string]string{
+	"0x41": "ARM Ltd", "0x42": "Broadcom", "0x43": "Cavium", "0x44": "DEC",
+	"0x46": "Fujitsu", "0x48": "HiSilicon", "0x49": "Infineon", "0x4e": "NVIDIA",
+	"0x50": "APM", "0x51": "Qualcomm", "0x53": "Samsung", "0x56": "Marvell",
+	"0x61": "Apple", "0x66": "Faraday", "0x69": "Intel", "0xc0": "Ampere",
+}
+
 // checkCPU records the CPU identity in enough detail to diff against a Fly
-// host, and asserts the few features that Fly's timekeeping depends on.
+// host, and asserts the few properties that Fly's timekeeping depends on.
 //
 // The full flag list is recorded deliberately. Fly migrates and restores
 // snapshots across hosts, and a snapshot taken on a host with a feature the
@@ -217,7 +293,7 @@ func cpuFlags() map[string]struct{} {
 // the guest, as an illegal instruction. Comparing flag sets is how that gets
 // caught before it is a production incident.
 func checkCPU(r *Report) {
-	model, vendor, family, modelNum, stepping, microcode := cpuIdentity()
+	id := cpuIdentity()
 	flags := cpuFlags()
 
 	sorted := make([]string, 0, len(flags))
@@ -226,18 +302,63 @@ func checkCPU(r *Report) {
 	}
 	sort.Strings(sorted)
 
-	r.Add(Result{ID: "host.cpu", Title: "CPU identity", Status: Info,
-		Detail: fmt.Sprintf("%s (%s family %s model %s stepping %s, microcode %s), %d logical CPUs",
-			model, vendor, family, modelNum, stepping, microcode, runtime.NumCPU()),
-		Data: map[string]any{
-			"model_name": model, "vendor": vendor, "family": family,
-			"model": modelNum, "stepping": stepping, "microcode": microcode,
-			"logical_cpus": runtime.NumCPU(), "flags": sorted,
-		}})
+	data := map[string]any{"logical_cpus": runtime.NumCPU(), "flags": sorted}
+	for k, v := range id {
+		data[k] = v
+	}
 
-	// Timekeeping. Fly's guests run on kvm-clock and the TSC; a TSC that stops
-	// in idle or varies with frequency makes guest time unreliable and makes
-	// snapshot restore worse than unreliable.
+	var desc string
+	if runtime.GOARCH == "arm64" {
+		impl := id["implementer"]
+		vendor := armImplementers[strings.ToLower(impl)]
+		if vendor == "" {
+			vendor = "implementer " + impl
+		}
+		data["vendor_name"] = vendor
+		desc = fmt.Sprintf("%s part %s rev %s (arch %s), %d logical CPUs",
+			vendor, orDash(id["part"]), orDash(id["revision"]),
+			orDash(id["architecture"]), runtime.NumCPU())
+	} else {
+		desc = fmt.Sprintf("%s (%s family %s model %s stepping %s, microcode %s), %d logical CPUs",
+			orDash(id["model_name"]), orDash(id["vendor"]), orDash(id["family"]),
+			orDash(id["model"]), orDash(id["stepping"]), orDash(id["microcode"]),
+			runtime.NumCPU())
+	}
+
+	r.Add(Result{ID: "host.cpu", Title: "CPU identity", Status: Info, Detail: desc, Data: data})
+
+	checkTimekeeping(r, flags)
+}
+
+// checkTimekeeping asserts that the host has a clock a guest can rely on.
+//
+// The property Fly needs is the same on both architectures -- a counter that
+// ticks at a constant rate, does not stop when the CPU idles, and can be read
+// without trapping to the hypervisor -- but how you establish it is not. On
+// x86 it is the constant_tsc and nonstop_tsc CPU flags plus a 'tsc'
+// clocksource. On aarch64 those flags do not exist: the architected generic
+// timer is constant-rate and free-running by specification, and the kernel
+// calls it 'arch_sys_counter'. Looking for constant_tsc on aarch64 produces
+// two warnings that mean nothing.
+func checkTimekeeping(r *Report, flags map[string]struct{}) {
+	cur := readFileDefault("/sys/devices/system/clocksource/clocksource0/current_clocksource", "unknown")
+	avail := readFileDefault("/sys/devices/system/clocksource/clocksource0/available_clocksource", "unknown")
+
+	switch runtime.GOARCH {
+	case "arm64":
+		if cur == "arch_sys_counter" {
+			r.Addf("host.clocksource", "Host clocksource", Pass,
+				"arch_sys_counter -- the architected generic timer, constant-rate and free-running "+
+					"by specification (available: %s)", avail)
+		} else {
+			r.Warn("host.clocksource", "Host clocksource",
+				fmt.Sprintf("current clocksource is %q, not arch_sys_counter (available: %s)", cur, avail),
+				"On aarch64 the architected generic timer is the clocksource a guest can read cheaply. "+
+					"Anything else is read through the hypervisor and costs an exit per timestamp.")
+		}
+		return
+	}
+
 	for _, want := range []struct{ flag, why string }{
 		{"constant_tsc", "TSC does not vary with CPU frequency"},
 		{"nonstop_tsc", "TSC does not stop in deep C-states"},
@@ -252,8 +373,6 @@ func checkCPU(r *Report) {
 		}
 	}
 
-	cur := readFileDefault("/sys/devices/system/clocksource/clocksource0/current_clocksource", "unknown")
-	avail := readFileDefault("/sys/devices/system/clocksource/clocksource0/available_clocksource", "unknown")
 	if cur == "tsc" {
 		r.Addf("host.clocksource", "Host clocksource", Pass, "tsc (available: %s)", avail)
 	} else {
@@ -265,11 +384,14 @@ func checkCPU(r *Report) {
 	}
 }
 
-func cpuIdentity() (model, vendor, family, modelNum, stepping, microcode string) {
-	model, vendor, family, modelNum, stepping, microcode = "unknown", "", "", "", "", ""
+// cpuIdentity returns the /proc/cpuinfo fields that identify the CPU. The
+// field names differ entirely between architectures, so both sets are
+// collected under neutral keys.
+func cpuIdentity() map[string]string {
+	id := map[string]string{}
 	f, err := os.Open("/proc/cpuinfo")
 	if err != nil {
-		return
+		return id
 	}
 	defer f.Close()
 	sc := bufio.NewScanner(f)
@@ -280,24 +402,40 @@ func cpuIdentity() (model, vendor, family, modelNum, stepping, microcode string)
 			continue
 		}
 		k, v = strings.TrimSpace(k), strings.TrimSpace(v)
+		var key string
 		switch k {
+		// x86
 		case "model name":
-			model = v
-		case "vendor_id", "CPU implementer":
-			vendor = v
-		case "cpu family", "CPU architecture":
-			family = v
-		case "model", "CPU variant":
-			if modelNum == "" {
-				modelNum = v
-			}
-		case "stepping", "CPU revision":
-			stepping = v
+			key = "model_name"
+		case "vendor_id":
+			key = "vendor"
+		case "cpu family":
+			key = "family"
+		case "model":
+			key = "model"
+		case "stepping":
+			key = "stepping"
 		case "microcode":
-			microcode = v
+			key = "microcode"
+		// aarch64
+		case "CPU implementer":
+			key = "implementer"
+		case "CPU architecture":
+			key = "architecture"
+		case "CPU variant":
+			key = "variant"
+		case "CPU part":
+			key = "part"
+		case "CPU revision":
+			key = "revision"
+		default:
+			continue
+		}
+		if _, seen := id[key]; !seen {
+			id[key] = v
 		}
 	}
-	return
+	return id
 }
 
 // checkKVMTuning reports the KVM module parameters that change microVM
@@ -363,15 +501,23 @@ func checkDevices(r *Report) {
 			"The node exists but this user cannot open it. Needs CAP_NET_ADMIN; the boot stage runs as root.")
 	}
 
-	// vhost-vsock. Fly puts an agent in every microVM and talks to it over
-	// vsock -- the sprite we pulled the reference kernel config from has a
-	// virtio-vsock device and no network path to its control plane.
+	// vhost-vsock, recorded but deliberately not required.
+	//
+	// Fly puts an agent in every microVM and reaches it over vsock, so it is
+	// tempting to demand the host module. But Firecracker does not use it:
+	// its vsock device is implemented inside the VMM and exposed on the host
+	// as a Unix domain socket, with only the guest side being virtio-vsock.
+	// So a host with no vhost_vsock runs Fly's vsock path perfectly well, and
+	// warning about it would send someone chasing a module they do not need.
 	if _, err := os.Stat("/dev/vhost-vsock"); err == nil {
-		r.Addf("host.vhost_vsock", "/dev/vhost-vsock present", Pass, "host/guest vsock available")
+		r.Addf("host.vhost_vsock", "/dev/vhost-vsock present", Info,
+			"available; note Firecracker does not use it -- its vsock is a host-side Unix socket, "+
+				"so this matters only for other VMMs")
 	} else {
-		r.Warn("host.vhost_vsock", "/dev/vhost-vsock present", fmt.Sprintf("%v", err),
-			"Fly's in-guest agent reaches the host over vsock, not the network. Load vhost_vsock "+
-				"(modprobe vhost_vsock). Not needed to boot a microVM, so the boot stage will still pass.")
+		r.Addf("host.vhost_vsock", "/dev/vhost-vsock present", Info,
+			"absent, which does not affect Firecracker: its vsock device is a host-side Unix "+
+				"socket and needs no host kernel module. The guest kernel still needs "+
+				"CONFIG_VIRTIO_VSOCKETS, which is a property of the guest image, not of this host")
 	}
 
 	// KVM's per-CPU CPUID device makes an exact CPU comparison possible.
@@ -568,7 +714,9 @@ var hostKernelOptions = []struct {
 	{"CONFIG_NET_NS", true, "network namespace per microVM (the jailer)"},
 	{"CONFIG_PID_NS", true, "pid namespace per microVM (the jailer)"},
 	{"CONFIG_EVENTFD", true, "ioeventfd/irqfd plumbing"},
-	{"CONFIG_VHOST_VSOCK", false, "host/guest control channel Fly's in-guest agent uses"},
+	// Not CONFIG_VHOST_VSOCK: Firecracker's vsock is a host-side Unix socket
+	// and needs no host module. The guest kernel needs CONFIG_VIRTIO_VSOCKETS,
+	// which is a property of the guest image -- see reference/.
 	{"CONFIG_USERFAULTFD", false, "lazy snapshot restore"},
 	{"CONFIG_IO_URING", false, "Firecracker's async block engine"},
 	{"CONFIG_TRANSPARENT_HUGEPAGE", false, "guest memory backing"},

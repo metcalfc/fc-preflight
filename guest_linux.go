@@ -41,6 +41,7 @@ var (
 	guestMask  = "255.255.255.252"
 	hostIP     = ""
 	guestPort  = echoPort
+	guestDisk  = ""
 )
 
 // parseGuestCmdline reads the fcpf.* parameters the host appended.
@@ -59,6 +60,8 @@ func parseGuestCmdline(cmdline string) {
 			hostIP = v
 		case "fcpf.iface":
 			guestIface = v
+		case "fcpf.disk":
+			guestDisk = v
 		case "fcpf.port":
 			if n, err := strconv.Atoi(v); err == nil {
 				guestPort = n
@@ -149,14 +152,15 @@ func runGuest() {
 	rep.MemWriteMBps = measureMemWrite()
 	guestLogf("memory write: %.0f MB/s", rep.MemWriteMBps)
 
-	if w, rd, err := measureDisk("/dev/vdb"); err == nil {
+	parseGuestCmdline(rep.Cmdline)
+
+	if w, rd, err := measureDisk(guestDisk); err == nil {
 		rep.DiskWriteMBps, rep.DiskReadMBps = w, rd
 		guestLogf("disk /dev/vdb: %.0f MB/s write, %.0f MB/s read", w, rd)
 	} else {
 		guestLogf("disk: skipped (%v)", err)
 	}
 
-	parseGuestCmdline(rep.Cmdline)
 	switch {
 	case guestIP == "" || hostIP == "":
 		rep.NetError = "no fcpf.ip/fcpf.host on the kernel command line"
@@ -244,28 +248,38 @@ func measureHash(workers int) float64 {
 }
 
 func measureMemWrite() float64 {
-	const size = 128 << 20
-	buf := make([]byte, size)
-	start := time.Now()
-	for i := 0; i < len(buf); i += 4096 {
-		buf[i] = byte(i)
+	// Sized to stay well inside the guest's memory: this runs in a 512 MiB
+	// microVM and an allocation that forces reclaim measures the balloon, not
+	// the memory.
+	const size = 64 << 20
+	const passes = 8
+
+	region := make([]byte, size)
+
+	// Fault the whole region in first, and do not count it. First touch is a
+	// page fault per page, which is a different measurement -- mixing the two
+	// is what made this report a fifth of the real bandwidth.
+	for i := 0; i < len(region); i += 4096 {
+		region[i] = 1
 	}
-	// Touch every byte of a smaller region to get a bandwidth number rather
-	// than a page-fault number.
-	region := buf[:32<<20]
-	for pass := 0; pass < 4; pass++ {
+
+	start := time.Now()
+	for pass := 0; pass < passes; pass++ {
 		for i := range region {
-			region[i] = byte(i)
+			region[i] = byte(pass)
 		}
 	}
 	elapsed := time.Since(start).Seconds()
-	return float64(4*len(region)) / elapsed / (1 << 20)
+	return float64(passes*len(region)) / elapsed / (1 << 20)
 }
 
 // measureDisk exercises a virtio-blk device the host attached as a scratch
 // drive. It writes with O_DIRECT off but fsyncs, which is what a guest
 // workload actually does.
 func measureDisk(dev string) (writeMBps, readMBps float64, err error) {
+	if dev == "" {
+		return 0, 0, fmt.Errorf("no fcpf.disk on the kernel command line")
+	}
 	f, err := os.OpenFile(dev, os.O_RDWR, 0)
 	if err != nil {
 		return 0, 0, err

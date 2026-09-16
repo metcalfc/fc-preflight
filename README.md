@@ -187,6 +187,35 @@ where it does not fails inside the guest as an illegal instruction, long after
 the restore reported success. Diffing flag sets is how that gets caught before
 it is an incident.
 
+## Testing it on a Mac, with Lima
+
+You do not need a spare Linux box to exercise this. On Apple Silicon **M3 or
+later**, Virtualization.framework exposes nested virtualization, so a Lima VM
+gets a real `/dev/kvm` and can run Firecracker.
+
+```sh
+brew install lima
+limactl start --set '.nestedVirtualization=true | .cpus=6 | .memory="8GiB"' \
+    --name=fcpf --tty=false template://default
+
+make release
+limactl copy dist/fc-preflight-linux-arm64 fcpf:/tmp/fc-preflight
+limactl shell fcpf -- sudo /tmp/fc-preflight -stage all -vms 6
+```
+
+Or `make lima-up` then `make lima-test`.
+
+This is how the boot stage was developed and verified. Two caveats:
+
+- It is **aarch64**. The x86_64 paths — the fourteen-capability list, the
+  `vmx`/`svm` and TSC checks, the amd64 artifacts — are built and vetted but
+  have not been run on real x86 KVM.
+- It is itself nested, so the tool correctly reports `NESTED` and the numbers
+  are not comparable to a bare-metal host. That is useful in its own right: it
+  is a live example of the output shape a nested Azure host will produce.
+
+On M1 and M2 there is no nested virtualization and `/dev/kvm` will not appear.
+
 ## Building
 
 ```sh
@@ -204,12 +233,27 @@ against a real `cpio` rather than against our own reader.
 
 ## Status
 
-Verified: builds and vets clean for linux/amd64 and linux/arm64; the cpio
-writer round-trips through system `cpio`; the full preflight has been run on a
-Linux host and correctly diagnoses a host with no `/dev/kvm`, including the
-case where `CONFIG_KVM=y` but neither vendor module is built.
+**Verified end to end.** Built and vetted for linux/amd64 and linux/arm64. On
+an aarch64 Linux host with real KVM (Lima on an M5, so itself nested):
 
-Not yet verified: the boot stage has not been run against real KVM, because no
-host with `/dev/kvm` was available while writing it. Expect to shake something
-out on the first run — `-v` and the console tail in the report are there for
-exactly that. Please send us whatever it does on first contact, working or not.
+- the preflight passes every KVM check, including creating a real VM and vCPU
+- the boot stage fetches and checksum-verifies Firecracker v1.17.0 and a guest
+  kernel, builds the initramfs, and boots a microVM that mounts its
+  filesystems, binds `virtio_blk` and `virtio_net`, runs the full workload,
+  reports over the serial console and shuts down cleanly (`exit_code=0`)
+- six concurrent microVMs do the same, with the per-VM spread reported
+
+The preflight has also been run on a host with no `/dev/kvm`, where it
+correctly identifies the cause — including the case where `CONFIG_KVM=y` but
+neither vendor module is built, which passes a naive config check and then has
+no device to open.
+
+**Not yet verified:** the x86_64 paths against real x86 KVM, and any run
+against Fly's own guest kernel. Both need hardware we did not have; neither is
+speculative code, but neither has been executed.
+
+Running it on real hardware taught us things that reading it would not have —
+an early version reported an Apple Virtualization guest as bare metal, because
+`hypervisor` is an x86-only CPU flag and aarch64 has no equivalent. On an Azure
+Arm SKU that would have been exactly the wrong answer. Please send the first
+run from a candidate host whatever it says.
