@@ -137,10 +137,24 @@ func checkKVM(r *Report) {
 
 	f, err := os.OpenFile("/dev/kvm", os.O_RDWR, 0)
 	if err != nil {
-		remedy := "Add the running user to the 'kvm' group, or run as root."
-		if os.IsPermission(err) {
-			r.Fail("kvm.open", "/dev/kvm openable", fmt.Sprintf("open: %v", err), remedy)
-		} else {
+		switch {
+		case os.IsPermission(err) && os.Geteuid() != 0:
+			// The device is there and the mode is the ordinary Ubuntu one
+			// (root:kvm 0660). Not being able to open it as an unprivileged
+			// user who is not in the kvm group is the expected, healthy
+			// state -- it is a fact about this invocation, not about the
+			// host, and calling it a failure would condemn a working machine.
+			r.Blocked("kvm.open", "/dev/kvm openable",
+				fmt.Sprintf("%v (running as uid %d, and %s)", err, os.Geteuid(), groupHint()),
+				"Re-run with sudo. Everything below this point -- the capability checks, "+
+					"KVM_CREATE_VM and KVM_CREATE_VCPU -- needs the device open, and those are "+
+					"the checks that actually decide whether Firecracker will run here.")
+		case os.IsPermission(err):
+			r.Fail("kvm.open", "/dev/kvm openable",
+				fmt.Sprintf("%v, while running as root", err),
+				"Root was refused the device. Something beyond file permissions is blocking it -- "+
+					"an LSM policy (AppArmor, SELinux) or a container seccomp profile. Check dmesg.")
+		default:
 			r.Fail("kvm.open", "/dev/kvm openable", fmt.Sprintf("open: %v", err),
 				"KVM is present but refused to open. Check dmesg for a kvm module error.")
 		}
@@ -237,6 +251,29 @@ func checkKVM(r *Report) {
 	}
 	syscall.Close(int(vcpufd))
 	r.Addf("kvm.create_vcpu", "KVM_CREATE_VCPU", Pass, "created a vCPU fd")
+}
+
+// groupHint reports whether the current user is in the kvm group, so the
+// remedy can be specific rather than offering both possibilities blindly.
+func groupHint() string {
+	gids, err := os.Getgroups()
+	if err != nil {
+		return "group membership could not be read"
+	}
+	fi, err := os.Stat("/dev/kvm")
+	if err != nil {
+		return "group membership could not be checked"
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return "group membership could not be checked"
+	}
+	for _, g := range gids {
+		if uint32(g) == st.Gid {
+			return "already in the device's group, so a re-login may be needed for it to take effect"
+		}
+	}
+	return fmt.Sprintf("not in the device's group (gid %d)", st.Gid)
 }
 
 func countRequired(caps []cap) int {

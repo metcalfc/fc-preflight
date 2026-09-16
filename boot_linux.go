@@ -413,9 +413,10 @@ func bootOne(ctx context.Context, i int, fcBin, kernel, initramfs, workDir strin
 // into an initramfs, boot N microVMs and judge what came back.
 func runBootStage(ctx context.Context, r *Report) {
 	if os.Geteuid() != 0 {
-		r.Fail("boot.privileges", "Root for the boot stage",
+		r.Blocked("boot.privileges", "Root for the boot stage",
 			fmt.Sprintf("running as uid %d", os.Geteuid()),
-			"Creating a tap device needs CAP_NET_ADMIN. Re-run the boot stage as root.")
+			"Giving a microVM a network interface means creating a tap device, which needs "+
+				"CAP_NET_ADMIN. Re-run with sudo. This says nothing about the host.")
 		return
 	}
 

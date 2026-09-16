@@ -36,7 +36,7 @@ Verify it arrived intact — `sha256sum /tmp/fc-preflight` against `SHA256SUMS`
 in the release, currently:
 
 ```
-ae1a46aad9b5ee3e987c84378573b9704f7cadf44b78b56b8c6b1fbb35880ddb  fc-preflight-linux-amd64
+7da6f178d285dd2d54345a45bea54366b2c2eb2efc0ea74efcd9fdd25aee7746  fc-preflight-linux-amd64
 ```
 
 The host needs `/dev/kvm`, root, `ip` from iproute2, and outbound HTTPS to
@@ -44,6 +44,11 @@ github.com and s3.amazonaws.com for stage two. If it has no egress, see
 [Offline](#offline) below.
 
 ---
+
+> **Run everything with `sudo`.** The boot stage creates a tap device, and
+> `/dev/kvm` is `root:kvm 0660` on a stock Ubuntu. Without root the run cannot
+> reach the checks that decide the answer, and it will tell you so (exit 3,
+> verdict INCOMPLETE) rather than pretending to have finished.
 
 ## Run 1 — preflight, and read every line
 

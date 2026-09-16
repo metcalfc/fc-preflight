@@ -23,7 +23,7 @@ import (
 	"syscall"
 )
 
-const version = "0.1.0"
+const version = "0.1.1"
 
 var (
 	flagStage       = flag.String("stage", "preflight", "which stage to run: preflight, boot, or all")
@@ -60,6 +60,19 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Say this before any output rather than leaving it to be inferred from a
+	// check that could not run. Without root the run cannot reach the checks
+	// that decide the answer, and a report that looks complete but is not is
+	// worse than no report.
+	if os.Geteuid() != 0 {
+		fmt.Fprintf(os.Stderr,
+			"warning: not running as root (uid %d).\n"+
+				"         The boot stage needs root to create a tap device, and /dev/kvm needs\n"+
+				"         either root or membership of its group. Re-run with sudo for a report\n"+
+				"         that can answer the question.\n\n",
+			os.Geteuid())
+	}
 
 	r := NewReport()
 
@@ -107,10 +120,13 @@ func main() {
 		}
 	}
 
-	// Exit 1 on any blocking failure, so this can gate a pipeline. Warnings
-	// never change the exit code.
-	if r.Verdict == Fail {
+	// Exit codes are distinct so a pipeline can tell "this host is unsuitable"
+	// from "this run could not tell". Warnings never change the exit code.
+	switch r.Verdict {
+	case Fail:
 		os.Exit(1)
+	case Blocked:
+		os.Exit(3)
 	}
 }
 
@@ -123,9 +139,13 @@ func hasArg(want string) bool {
 	return false
 }
 
+// hasBlockingKVMFailure reports whether the preflight already established that
+// the boot stage cannot work or cannot be judged. Blocked counts as well as
+// Fail: if /dev/kvm could not even be opened, booting would fail for that same
+// reason and bury it under a less specific message.
 func hasBlockingKVMFailure(r *Report) bool {
 	for _, res := range r.Results {
-		if res.Status != Fail {
+		if res.Status != Fail && res.Status != Blocked {
 			continue
 		}
 		switch res.ID {
@@ -153,7 +173,8 @@ STAGES
   -stage all         both.
 
 EXAMPLES
-  # What most people want first, on a candidate host:
+  # What most people want first, on a candidate host. sudo is not optional:
+  # without it the checks that decide the answer cannot run.
   sudo fc-preflight -stage all -json report.json
 
   # Air-gapped host, artifacts staged by hand:
@@ -168,8 +189,10 @@ EXAMPLES
 
 EXIT STATUS
   0  no blocking failures (warnings may still be present)
-  1  at least one blocking failure
+  1  the host is unsuitable: at least one blocking failure
   2  bad usage
+  3  incomplete: nothing disqualifying found, but a check could not be run
+     (almost always missing root -- re-run with sudo)
 
 FLAGS
 `, version)

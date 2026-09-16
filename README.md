@@ -15,8 +15,20 @@ it exits.
 sudo ./fc-preflight -stage all -json report.json
 ```
 
-Exit status is 0 if nothing blocking was found and 1 otherwise, so it can gate
-a pipeline. Send us `report.json`.
+`sudo` is not decoration: the boot stage creates a tap device, and `/dev/kvm`
+is `root:kvm 0660` on a stock Ubuntu.
+
+Exit status distinguishes three outcomes, so this can gate a pipeline:
+
+| | |
+| --- | --- |
+| `0` | nothing blocking found (warnings may still be present) |
+| `1` | the host is unsuitable |
+| `3` | incomplete — nothing disqualifying found, but a check could not be run |
+
+Exit 3 is almost always a missing `sudo`. It is deliberately not exit 1: "I
+could not determine this" and "this host will not work" are different answers,
+and only one of them is about the host. Send us `report.json`.
 
 If the host has no outbound network access, stage the two artifacts by hand
 (see [Artifacts](#artifacts)) and add `-offline`:

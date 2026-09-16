@@ -28,6 +28,13 @@ const (
 	Warn Status = "warn"
 	Info Status = "info"
 	Skip Status = "skip"
+	// Blocked means the run could not determine the answer -- almost always
+	// because of how it was invoked, not because of anything about the host.
+	// Keeping this separate from Fail is not cosmetic: reporting "a Fly
+	// microVM will not run correctly here" because the operator forgot sudo
+	// is a wrong answer about someone else's hardware, and the person reading
+	// it has no way to tell it is wrong.
+	Blocked Status = "blocked"
 )
 
 // Result is one check.
@@ -82,24 +89,41 @@ func (r *Report) Addf(id, title string, st Status, format string, args ...any) {
 
 // Fail records a failure together with what to do about it. Every Fail should
 // carry a remedy; a failure the operator cannot act on is a bug in this tool.
+//
+// Fail is a statement about the host. If the check could not be carried out,
+// that is Blocked, not Fail.
 func (r *Report) Fail(id, title, detail, remedy string) {
 	r.Add(Result{ID: id, Title: title, Status: Fail, Detail: detail, Remedy: remedy})
+}
+
+// Blocked records a check that could not be carried out, and how to unblock
+// it. It says nothing about the host either way.
+func (r *Report) Blocked(id, title, detail, remedy string) {
+	r.Add(Result{ID: id, Title: title, Status: Blocked, Detail: detail, Remedy: remedy})
 }
 
 func (r *Report) Warn(id, title, detail, remedy string) {
 	r.Add(Result{ID: id, Title: title, Status: Warn, Detail: detail, Remedy: remedy})
 }
 
-// Finish computes the verdict. Any Fail fails the run; warnings never do.
+// Finish computes the verdict. Any Fail fails the run; a Blocked with no Fail
+// makes the run incomplete rather than failed; warnings never do either.
 func (r *Report) Finish() {
 	r.Duration = time.Since(r.start).Round(time.Millisecond).String()
 	r.Summary = map[Status]int{}
 	r.Verdict = Pass
+	var blocked bool
 	for _, res := range r.Results {
 		r.Summary[res.Status]++
-		if res.Status == Fail {
+		switch res.Status {
+		case Fail:
 			r.Verdict = Fail
+		case Blocked:
+			blocked = true
 		}
+	}
+	if blocked && r.Verdict != Fail {
+		r.Verdict = Blocked
 	}
 }
 
@@ -122,6 +146,8 @@ func renderOne(res Result) string {
 		mark = " info "
 	case Skip:
 		mark = " skip "
+	case Blocked:
+		mark = "BLOCKED"
 	}
 	line := fmt.Sprintf("[%s] %-34s %s", mark, res.ID, res.Title)
 	if res.Detail != "" {
@@ -154,7 +180,7 @@ func (r *Report) Render(w io.Writer) {
 
 	fmt.Fprintf(w, "\n%s\n", strings.Repeat("=", 78))
 
-	keys := []Status{Pass, Warn, Fail, Info, Skip}
+	keys := []Status{Pass, Warn, Fail, Blocked, Info, Skip}
 	var parts []string
 	for _, k := range keys {
 		if n := r.Summary[k]; n > 0 {
@@ -163,16 +189,28 @@ func (r *Report) Render(w io.Writer) {
 	}
 	fmt.Fprintf(w, "%s in %s\n", strings.Join(parts, ", "), r.Duration)
 
-	var fails, warns []Result
+	var fails, warns, blocked []Result
 	for _, res := range r.Results {
 		switch res.Status {
 		case Fail:
 			fails = append(fails, res)
 		case Warn:
 			warns = append(warns, res)
+		case Blocked:
+			blocked = append(blocked, res)
 		}
 	}
 	sort.SliceStable(fails, func(i, j int) bool { return fails[i].ID < fails[j].ID })
+
+	if len(blocked) > 0 {
+		fmt.Fprintf(w, "\nCOULD NOT DETERMINE -- this says nothing about the host, only about\nthis run. Address these and run again:\n")
+		for _, res := range blocked {
+			fmt.Fprintf(w, "  * %s: %s\n", res.ID, res.Detail)
+			if res.Remedy != "" {
+				fmt.Fprintf(w, "    %s\n", res.Remedy)
+			}
+		}
+	}
 
 	if len(fails) > 0 {
 		fmt.Fprintf(w, "\nBLOCKING -- a Fly microVM will not run correctly here:\n")
@@ -193,5 +231,9 @@ func (r *Report) Render(w io.Writer) {
 		}
 	}
 
-	fmt.Fprintf(w, "\nVERDICT: %s\n\n", strings.ToUpper(string(r.Verdict)))
+	verdict := strings.ToUpper(string(r.Verdict))
+	if r.Verdict == Blocked {
+		verdict = "INCOMPLETE -- nothing disqualifying found, but the run could not finish"
+	}
+	fmt.Fprintf(w, "\nVERDICT: %s\n\n", verdict)
 }
