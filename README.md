@@ -66,6 +66,7 @@ booting would only restate the same finding with less detail.
 | KVM tuning | `halt_poll_ns`, EPT/NPT, nested, SEV. EPT/NPT disabled is a hard failure. |
 | Devices | `/dev/net/tun` for guest networking, `/dev/vhost-vsock` for Fly's in-guest agent. |
 | Syscalls | `io_uring` (Firecracker's async block engine), `userfaultfd` (lazy snapshot restore), seccomp-bpf (Firecracker's sandbox). |
+| Packet filter | A default-deny input chain, or one dropping RFC1918 destinations, which would block the guest's traffic in the boot stage. |
 | cgroups | v2 unified, with `cpu`, `cpuset`, `memory`, `io`, `pids`. |
 | Memory | Overcommit mode, transparent hugepages, `vm.max_map_count`, open-file limit. |
 | Host kernel config | Read from `/proc/config.gz` or `/boot/config-$(uname -r)` when available. |
@@ -111,7 +112,10 @@ can read in this repo rather than whatever a downloaded rootfs happens to start
 at boot.
 
 Each microVM gets 2 vCPUs, 512 MiB, a 64 MiB scratch virtio-blk device and its
-own tap on its own `/30`. Inside, the guest mounts `/proc`, `/sys` and `/dev`,
+own tap on its own `/30`, carved from `-guest-net` (default `172.31.240.0/22`).
+Move that range if the host's firewall drops it — every private range is
+something somebody's policy blocks, and `host.firewall` in the preflight warns
+when this host has such a policy. Inside, the guest mounts `/proc`, `/sys` and `/dev`,
 then measures:
 
 - which virtio devices it found and which drivers bound to them
@@ -254,12 +258,23 @@ correctly identifies the cause — including the case where `CONFIG_KVM=y` but
 neither vendor module is built, which passes a naive config check and then has
 no device to open.
 
-**Not yet verified:** the x86_64 paths against real x86 KVM, and any run
-against Fly's own guest kernel. Both need hardware we did not have; neither is
-speculative code, but neither has been executed.
+**x86_64 is verified too**, on an Intel bare-metal host: all 14 required KVM
+capabilities resolve, `KVM_CREATE_VM`/`KVM_CREATE_VCPU` succeed, and a microVM
+boots in 90 ms to init, binds `virtio_blk` and `virtio_net`, and runs the
+workload. The one check not exercised there is the guest↔host network round
+trip, because that host drops RFC1918 traffic by policy — which is what
+`host.firewall` now warns about up front.
 
-Running it on real hardware taught us things that reading it would not have —
-an early version reported an Apple Virtualization guest as bare metal, because
-`hypervisor` is an x86-only CPU flag and aarch64 has no equivalent. On an Azure
-Arm SKU that would have been exactly the wrong answer. Please send the first
-run from a candidate host whatever it says.
+**Not yet verified:** any run against Fly's own guest kernel, which has to come
+from Fly's infrastructure team.
+
+Running it on real hardware taught us things that reading it would not have.
+An early version reported an Apple Virtualization guest as bare metal, because
+`hypervisor` is an x86-only CPU flag and aarch64 has no equivalent — on an
+Azure Arm SKU that would have been exactly the wrong answer. Another reported a
+healthy host as unsuitable because it had been run without `sudo`. A third
+packed a dynamically linked binary into the initramfs and panicked the guest
+with an ENOENT that pointed at the archive rather than at the binary.
+
+None of those were visible by reading the code. Please send the first run from
+a candidate host whatever it says.

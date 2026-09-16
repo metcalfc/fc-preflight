@@ -23,7 +23,7 @@ import (
 	"syscall"
 )
 
-const version = "0.1.1"
+const version = "0.1.2"
 
 var (
 	flagStage       = flag.String("stage", "preflight", "which stage to run: preflight, boot, or all")
@@ -38,6 +38,7 @@ var (
 	flagMemMiB      = flag.Int("mem", 512, "memory per microVM, in MiB")
 	flagBootTimeout = flag.Int("boot-timeout", 90, "seconds to wait for a microVM to report and exit")
 	flagBootArgs    = flag.String("boot-args", defaultBootArgs, "guest kernel command line")
+	flagGuestNet    = flag.String("guest-net", "172.31.240.0/22", "IPv4 range to carve per-microVM /30s from")
 	flagGuest       = flag.Bool("guest", false, "internal: run as the microVM's init")
 )
 
@@ -55,6 +56,11 @@ func main() {
 
 	if runtime.GOOS != "linux" {
 		fmt.Fprintf(os.Stderr, "fc-preflight runs on Linux; this is %s\n", runtime.GOOS)
+		os.Exit(2)
+	}
+
+	if err := resolveGuestNet(*flagGuestNet, *flagVMs); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(2)
 	}
 

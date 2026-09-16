@@ -10,6 +10,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
+	"debug/elf"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -84,12 +85,47 @@ const (
 	echoPort  = 52345
 )
 
-func vmHostIP(i int) string  { return fmt.Sprintf("172.31.%d.1", 240+i) }
-func vmGuestIP(i int) string { return fmt.Sprintf("172.31.%d.2", 240+i) }
+// Each microVM gets a /30 carved out of -guest-net: .1 is the host end of the
+// tap, .2 is the guest. The range is a flag because every private range is
+// something somebody's firewall drops, and being able to move is cheaper than
+// arguing with a policy.
+func vmBase(i int) uint32 { return guestNetBase + uint32(i)*4 }
+
+func ipString(v uint32) string {
+	return fmt.Sprintf("%d.%d.%d.%d", byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
+}
+
+func vmHostIP(i int) string  { return ipString(vmBase(i) + 1) }
+func vmGuestIP(i int) string { return ipString(vmBase(i) + 2) }
 func vmTap(i int) string     { return fmt.Sprintf("%s%d", tapPrefix, i) }
-func vmMAC(i int) string     { return fmt.Sprintf("06:00:AC:1F:%02X:02", 240+i) }
+func vmMAC(i int) string {
+	b := vmBase(i) + 2
+	return fmt.Sprintf("06:00:%02X:%02X:%02X:%02X", byte(b>>24), byte(b>>16), byte(b>>8), byte(b))
+}
 
 const guestNetmask = "255.255.255.252"
+
+// guestNetBase is the first address of -guest-net, resolved at startup.
+var guestNetBase uint32
+
+// resolveGuestNet parses -guest-net and checks it is big enough for -vms.
+func resolveGuestNet(cidr string, vms int) error {
+	ip, ipnet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return fmt.Errorf("-guest-net %q: %w", cidr, err)
+	}
+	v4 := ip.To4()
+	if v4 == nil {
+		return fmt.Errorf("-guest-net %q: must be IPv4", cidr)
+	}
+	ones, bits := ipnet.Mask.Size()
+	if avail := 1 << (bits - ones) / 4; avail < vms {
+		return fmt.Errorf("-guest-net %s holds %d /30s but -vms is %d", cidr, avail, vms)
+	}
+	base := ipnet.IP.To4()
+	guestNetBase = uint32(base[0])<<24 | uint32(base[1])<<16 | uint32(base[2])<<8 | uint32(base[3])
+	return nil
+}
 
 // defaultBootArgs is the Firecracker-documented baseline, not Fly's.
 //
@@ -99,6 +135,57 @@ const guestNetmask = "255.255.255.252"
 // devices at all. The difference is worth knowing about but is not something
 // to reproduce in a portability test; -boot-args overrides if you want to.
 const defaultBootArgs = "console=ttyS0 reboot=k panic=1 pci=off"
+
+// consoleTailLines is how much of the guest's console to keep for a failure
+// report. It was 40, which was not enough: a guest that panics prints a stack
+// trace, and the line that says *why* -- the initramfs unpack result, or the
+// exec failure -- scrolls off the top before the panic ends.
+const consoleTailLines = 120
+
+// elfInterpreter reports the ELF interpreter a binary requires, if any. A
+// binary with no PT_INTERP segment is statically linked.
+func elfInterpreter(path string) (interp string, dynamic bool, err error) {
+	f, err := elf.Open(path)
+	if err != nil {
+		return "", false, err
+	}
+	defer f.Close()
+	for _, p := range f.Progs {
+		if p.Type != elf.PT_INTERP {
+			continue
+		}
+		buf, err := io.ReadAll(p.Open())
+		if err != nil {
+			return "", true, nil // it has one; we just could not read it
+		}
+		return strings.TrimRight(string(buf), "\x00"), true, nil
+	}
+	return "", false, nil
+}
+
+// diagnoseConsole turns a guest that died into a sentence, for the failures
+// whose console signature we recognise. Without this the report hands over a
+// kernel stack trace and leaves the reader to know that ENOENT on init means
+// a missing ELF interpreter rather than a missing file.
+func diagnoseConsole(lines []string) string {
+	joined := strings.Join(lines, "\n")
+	switch {
+	case strings.Contains(joined, "Failed to execute /init (error -2)"):
+		return "The kernel booted, found /init and could not exec it (ENOENT). For a static " +
+			"binary that means the file is absent; for a dynamic one it means its interpreter " +
+			"is, and the guest has no libc. Check boot.initramfs.linkage above."
+	case strings.Contains(joined, "Initramfs unpacking failed"):
+		return "The kernel rejected the initramfs archive, so the guest root filesystem is empty. " +
+			"This is a bug in this tool's cpio writer, not in the host -- please report the " +
+			"console output."
+	case strings.Contains(joined, "No working init found"):
+		return "The guest root filesystem came up empty. Either the initramfs did not unpack or " +
+			"/init is not in it."
+	case strings.Contains(joined, "Kernel panic"):
+		return "The guest kernel panicked. The console tail above is the whole of what it said."
+	}
+	return ""
+}
 
 // resolveArtifact returns a local path to a pinned artifact, downloading it
 // into the cache directory if it is not already there and verifying the digest
@@ -369,7 +456,7 @@ func bootOne(ctx context.Context, i int, fcBin, kernel, initramfs, workDir strin
 	sc.Buffer(make([]byte, 1<<20), 1<<20)
 	for sc.Scan() {
 		line := sc.Text()
-		if len(tail) >= 40 {
+		if len(tail) >= consoleTailLines {
 			tail = tail[1:]
 		}
 		tail = append(tail, line)
@@ -467,6 +554,36 @@ func runBootStage(ctx context.Context, r *Report) {
 		r.Fail("boot.initramfs", "Build initramfs", fmt.Sprintf("locate own binary: %v", err), "")
 		return
 	}
+
+	// This binary becomes the guest's init, and the guest has nothing in it
+	// but this binary -- no libc, no dynamic loader. So being statically
+	// linked is a correctness requirement, not a build preference, and it is
+	// checked here rather than discovered as a kernel panic.
+	//
+	// It is easy to get wrong: `go build` on a host with a C compiler defaults
+	// to CGO_ENABLED=1, and this package imports net, which then links libc
+	// dynamically. The resulting guest fails with "Failed to execute /init
+	// (error -2)" -- ENOENT for the missing interpreter, which reads like a
+	// missing file and sends you looking at the archive instead of the binary.
+	if interp, dynamic, err := elfInterpreter(self); err != nil {
+		r.Warn("boot.initramfs.linkage", "Statically linked",
+			fmt.Sprintf("could not parse own ELF headers: %v", err),
+			"Proceeding anyway. If the guest panics with \"Failed to execute /init (error -2)\", "+
+				"this binary is dynamically linked and must be rebuilt with CGO_ENABLED=0.")
+	} else if dynamic {
+		r.Fail("boot.initramfs.linkage", "Statically linked",
+			fmt.Sprintf("this binary is dynamically linked (interpreter %s)", interp),
+			"The guest is this binary and nothing else -- no libc, no dynamic loader -- so a "+
+				"dynamically linked build cannot be exec'd as init and the guest would panic with "+
+				"\"Failed to execute /init (error -2)\". Rebuild with CGO_ENABLED=0 "+
+				"(`make release`, or `CGO_ENABLED=0 go build`), or use a release binary. "+
+				"Plain `go build` produces a dynamic binary on any host that has a C compiler.")
+		return
+	} else {
+		r.Addf("boot.initramfs.linkage", "Statically linked", Pass,
+			"no interpreter; the guest can exec this as init")
+	}
+
 	selfBytes, err := os.ReadFile(self)
 	if err != nil {
 		r.Fail("boot.initramfs", "Build initramfs", fmt.Sprintf("read own binary: %v", err), "")
@@ -530,10 +647,17 @@ func judgeOutcomes(r *Report, outcomes []vmOutcome) {
 				}
 			}
 		}
+		remedy := "This is the check that matters. Everything in the preflight can pass on a host " +
+			"where this fails. The console tail above is the guest's own output."
+		for _, o := range outcomes {
+			if d := diagnoseConsole(o.Console); d != "" {
+				remedy = d
+				break
+			}
+		}
 		r.Fail("boot.launch", "Firecracker microVM boots",
 			fmt.Sprintf("%d of %d microVMs failed:\n%s", failed, len(outcomes), detail.String()),
-			"This is the check that matters. Everything in the preflight can pass on a host where "+
-				"this fails. The console tail above is the guest's own output.")
+			remedy)
 		return
 	}
 
@@ -608,8 +732,12 @@ func judgeOutcomes(r *Report, outcomes []vmOutcome) {
 	if len(netErrs) > 0 {
 		r.Fail("boot.network", "Guest networking",
 			strings.Join(netErrs, "; "),
-			"The guest could not reach the host over its tap device. Check that nothing on the host "+
-				"is filtering traffic on the 172.31.240.0/22 range.")
+			fmt.Sprintf("The guest booted and bound virtio-net but could not reach the host over its "+
+				"tap. The usual cause is a host packet filter -- see host.firewall above, and check "+
+				"for a default-deny input chain or a rule dropping RFC1918 destinations, either of "+
+				"which covers %s. Move the guests with -guest-net, or allow that range on the %s* "+
+				"interfaces. A timeout here is about the host's policy, not about Firecracker.",
+				*flagGuestNet, tapPrefix))
 	} else {
 		rttMean, rttLo, rttHi := stat(func(g *GuestReport) float64 { return g.NetEchoRTTus })
 		tpMean, tpLo, tpHi := stat(func(g *GuestReport) float64 { return g.NetThroughput })

@@ -586,6 +586,62 @@ func checkSyscalls(r *Report) {
 	}
 }
 
+// checkHostFirewall looks for a host packet filter that will drop the guest's
+// traffic before the boot stage ever gets to test it.
+//
+// This is not hypothetical. The first x86 host this tool ran on had a CI
+// isolation policy dropping everything to 10/8, 172.16/12 and 192.168/16 plus
+// an input chain defaulting to drop -- so the microVM booted perfectly, bound
+// virtio-net, configured its interface, and then timed out talking to a host
+// three feet away. Without this check that reads as "networking is broken",
+// which is a slander on a host that is behaving exactly as configured.
+func checkHostFirewall(r *Report) {
+	type probe struct {
+		name string
+		args []string
+		// deny is the text indicating a default-deny input path.
+		deny []string
+	}
+	probes := []probe{
+		{"nftables", []string{"nft", "list", "ruleset"}, []string{"policy drop"}},
+		{"iptables", []string{"iptables", "-S"}, []string{"-P INPUT DROP", "-P FORWARD DROP"}},
+	}
+
+	var found []string
+	for _, p := range probes {
+		path, err := exec.LookPath(p.args[0])
+		if err != nil {
+			continue
+		}
+		out, err := exec.Command(path, p.args[1:]...).Output()
+		if err != nil {
+			continue // usually just not root; the boot stage will find out
+		}
+		text := string(out)
+		for _, d := range p.deny {
+			if strings.Contains(text, d) {
+				found = append(found, fmt.Sprintf("%s (%q)", p.name, d))
+				break
+			}
+		}
+	}
+
+	if len(found) == 0 {
+		r.Addf("host.firewall", "Host packet filter", Pass,
+			"no default-deny input path found that would block guest traffic")
+		return
+	}
+
+	r.Warn("host.firewall", "Host packet filter",
+		fmt.Sprintf("a default-deny policy is present: %s", strings.Join(found, ", ")),
+		"The boot stage gives each microVM a tap device and has the guest talk to the host over "+
+			"it. A default-deny input chain, or a rule dropping RFC1918 destinations, will block "+
+			"that and the guest networking check will fail on an otherwise healthy host. Either "+
+			"allow the guest range (see -guest-net, default 172.31.240.0/22) on the tap "+
+			"interfaces, or move the guests to a range your policy permits. This is a warning, "+
+			"not a failure: the policy may well be intentional.")
+}
+
 // checkCgroups. Fly bounds every microVM's CPU and memory with cgroup v2;
 // Firecracker's jailer places the process into a cgroup at startup.
 func checkCgroups(r *Report) {
@@ -857,6 +913,7 @@ func runPreflight(r *Report) {
 	checkKVMTuning(r)
 	checkDevices(r)
 	checkSyscalls(r)
+	checkHostFirewall(r)
 	checkCgroups(r)
 	checkMemory(r)
 	checkHostKernelConfig(r)

@@ -34,8 +34,19 @@ func TestInitramfsIsReadableByCpio(t *testing.T) {
 	cmd.Stdin = bytes.NewReader(archive)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("cpio refused the archive: %v\n%s", err, stderr.String())
+	err = cmd.Run()
+
+	// Extracting dev/console needs mknod, which an unprivileged user does not
+	// have. That is a property of the test environment, not of the archive,
+	// and the device node is asserted separately from its header in
+	// TestInitramfsCarriesConsoleDeviceNode. Any *other* complaint from cpio
+	// is a real defect in what we wrote.
+	if err != nil {
+		if !strings.Contains(stderr.String(), "mknod") {
+			t.Fatalf("cpio refused the archive: %v\n%s", err, stderr.String())
+		}
+		t.Logf("cpio could not create the device node (not root); "+
+			"checking the rest of the archive: %s", strings.TrimSpace(stderr.String()))
 	}
 
 	// /init must be there, executable, and byte-identical: the guest is the

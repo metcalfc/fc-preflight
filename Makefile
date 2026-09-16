@@ -9,8 +9,8 @@ help: ## List targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  %-14s %s\n", $$1, $$2}'
 
 .PHONY: build
-build: ## Build for the host platform
-	go build -trimpath -o $(BIN) .
+build: ## Build for the host platform (static: the binary is also the guest init)
+	CGO_ENABLED=0 go build -trimpath -o $(BIN) .
 
 .PHONY: release
 release: ## Build static linux/amd64 and linux/arm64 binaries into dist/

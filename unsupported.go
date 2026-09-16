@@ -18,6 +18,8 @@ const defaultBootArgs = "console=ttyS0 reboot=k panic=1 pci=off"
 
 const guestReportPrefix = "FCPF-REPORT "
 
+func resolveGuestNet(string, int) error { return nil }
+
 func runGuest() {
 	fmt.Fprintln(os.Stderr, "fc-preflight guest mode is Linux-only")
 	os.Exit(2)
