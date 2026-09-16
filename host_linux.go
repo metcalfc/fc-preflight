@@ -520,6 +520,28 @@ func checkDevices(r *Report) {
 				"CONFIG_VIRTIO_VSOCKETS, which is a property of the guest image, not of this host")
 	}
 
+	// NBD. Fly's workload storage is backed by network block devices, so the
+	// module has to be present and able to create a device node.
+	if _, err := os.Stat("/dev/nbd0"); err == nil {
+		r.Addf("host.nbd", "/dev/nbd0 present", Pass, "network block devices available")
+	} else if out, lderr := exec.Command("modprobe", "-n", "nbd").CombinedOutput(); lderr == nil {
+		r.Addf("host.nbd", "/dev/nbd0 present", Pass,
+			"not loaded, but the nbd module is available (modprobe nbd): %s",
+			strings.TrimSpace(string(out)))
+	} else {
+		r.Warn("host.nbd", "/dev/nbd0 present", fmt.Sprintf("%v", err),
+			"Fly's workload storage is backed by network block devices. Load the nbd module "+
+				"(modprobe nbd). Not needed to boot a microVM, so the boot stage still passes.")
+	}
+
+	// nftables, for guest network filtering and NAT.
+	if _, err := exec.LookPath("nft"); err == nil {
+		r.Addf("host.nftables", "nftables available", Pass, "nft present")
+	} else {
+		r.Warn("host.nftables", "nftables available", "nft not found in PATH",
+			"Install nftables. Guest egress filtering and NAT are built on it.")
+	}
+
 	// KVM's per-CPU CPUID device makes an exact CPU comparison possible.
 	if _, err := os.Stat("/dev/cpu/0/cpuid"); err == nil {
 		r.Addf("host.cpuid_dev", "/dev/cpu/0/cpuid present", Info, "raw CPUID readable for exact host comparison")
@@ -773,12 +795,13 @@ var hostKernelOptions = []struct {
 	// Not CONFIG_VHOST_VSOCK: Firecracker's vsock is a host-side Unix socket
 	// and needs no host module. The guest kernel needs CONFIG_VIRTIO_VSOCKETS,
 	// which is a property of the guest image -- see reference/.
+	{"CONFIG_BLK_DEV_NBD", true, "network block devices, which back workload storage"},
+	{"CONFIG_NF_TABLES", true, "nftables, for guest network filtering and NAT"},
 	{"CONFIG_USERFAULTFD", false, "lazy snapshot restore"},
 	{"CONFIG_IO_URING", false, "Firecracker's async block engine"},
 	{"CONFIG_TRANSPARENT_HUGEPAGE", false, "guest memory backing"},
 	{"CONFIG_KSM", false, "same-page merging across microVMs; optional density lever"},
 	{"CONFIG_USER_NS", false, "unprivileged jailer configurations"},
-	{"CONFIG_NF_TABLES", false, "guest egress NAT"},
 }
 
 // checkHostKernelConfig reads the running kernel's config, if the host exposes

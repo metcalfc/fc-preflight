@@ -64,7 +64,7 @@ booting would only restate the same finding with less detail.
 | CPU | `vmx`/`svm`, `constant_tsc`, `nonstop_tsc`, host clocksource, and the **full CPU flag list**. |
 | KVM | `/dev/kvm` opens, `KVM_GET_API_VERSION` is 12, every capability Firecracker requires is present, and a VM and vCPU can actually be created. |
 | KVM tuning | `halt_poll_ns`, EPT/NPT, nested, SEV. EPT/NPT disabled is a hard failure. |
-| Devices | `/dev/net/tun` for guest networking, `/dev/vhost-vsock` for Fly's in-guest agent. |
+| Devices | `/dev/net/tun` for guest networking, `/dev/nbd0` for workload storage, `nft` for filtering and NAT, `/dev/vhost-vsock` (recorded; Firecracker does not need it). |
 | Syscalls | `io_uring` (Firecracker's async block engine), `userfaultfd` (lazy snapshot restore), seccomp-bpf (Firecracker's sandbox). |
 | Packet filter | A default-deny input chain, or one dropping RFC1918 destinations, which would block the guest's traffic in the boot stage. |
 | cgroups | v2 unified, with `cpu`, `cpuset`, `memory`, `io`, `pids`. |

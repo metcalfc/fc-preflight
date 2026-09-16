@@ -23,7 +23,7 @@ import (
 	"syscall"
 )
 
-const version = "0.1.3"
+const version = "0.1.4"
 
 var (
 	flagStage       = flag.String("stage", "preflight", "which stage to run: preflight, boot, or all")
